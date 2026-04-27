@@ -123,6 +123,10 @@ def train_epoch(
                 }
             )
 
+            # Periodic GPU memory cleanup (every 5 batches)
+            if (batch_idx + 1) % 5 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     # Average metrics
     avg_loss = total_loss / max(len(train_loader), 1)
     avg_dsc = np.mean(all_dsc) if all_dsc else 0.0
@@ -197,6 +201,12 @@ def main(args):
     # Setup device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
+
+    # GPU memory optimization
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        logger.info("GPU memory cleared")
 
     # Setup directories
     checkpoint_dir, log_dir = setup_directories(config)
@@ -281,13 +291,19 @@ def main(args):
     best_dsc = 0.0
 
     for epoch in range(config["train"]["num_epochs"]):
+        # Clear GPU memory at start of each epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         # Train
         train_metrics = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch, config
         )
-
         # Validate
         if (epoch + 1) % config["train_config"]["validation_frequency"] == 0:
+            # Clear GPU memory before validation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             val_metrics = validate(model, val_loader, criterion, device, config)
 
             logger.info(
@@ -295,6 +311,14 @@ def main(args):
                 f"Train Loss: {train_metrics['loss']:.4f} DSC: {train_metrics['dsc']:.4f} | "
                 f"Val Loss: {val_metrics['loss']:.4f} DSC: {val_metrics['dsc']:.4f}"
             )
+
+            # Clear GPU memory after validation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache(
+                    f"Epoch {epoch+1}/{config['train']['num_epochs']} | "
+                    f"Train Loss: {train_metrics['loss']:.4f} DSC: {train_metrics['dsc']:.4f} | "
+                    f"Val Loss: {val_metrics['loss']:.4f} DSC: {val_metrics['dsc']:.4f}"
+                )
 
             # Save best checkpoint
             if val_metrics["dsc"] > best_dsc:

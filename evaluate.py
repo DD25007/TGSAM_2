@@ -212,6 +212,12 @@ def main(args):
     # Setup device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
+    
+    # GPU memory optimization
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        logger.info("GPU memory cleared")
 
     # Load test dataset
     logger.info("Loading test dataset...")
@@ -259,6 +265,11 @@ def main(args):
 
     # Evaluate
     logger.info("Starting evaluation...")
+    
+    # Clear GPU memory before evaluation
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     results = evaluate(
         model,
         test_loader,
@@ -266,6 +277,10 @@ def main(args):
         config,
         threshold=config["eval"]["threshold"],
     )
+    
+    # Clear GPU memory after evaluation
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Print results
     logger.info("\n" + "=" * 60)
