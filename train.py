@@ -86,7 +86,7 @@ def train_epoch(
                 result = model(
                     frames=seq_img.unsqueeze(0),  # (1, T, 3, H, W)
                     texts=[prompt],  # List with one text
-                    gt_masks=seq_mask.unsqueeze(0).unsqueeze(1),  # (1, T, 1, H, W)
+                    gt_masks=seq_mask.unsqueeze(0).unsqueeze(2),  # (1, T, 1, H, W)
                 )
                 outputs = result["pred_masks"].squeeze(0)  # (T, 1, H, W)
 
@@ -103,6 +103,9 @@ def train_epoch(
 
             except Exception as e:
                 logger.warning(f"Error processing sequence: {e}")
+                import traceback
+
+                logger.warning(f"Traceback: {traceback.format_exc()}")
                 continue
 
         # Backward pass

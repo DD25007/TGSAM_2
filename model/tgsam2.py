@@ -38,9 +38,9 @@ except ImportError:
 
 # ---------------------------------------------------------------------------
 # SAM-2 channel dims for hiera_small
-# FPN levels (fine → coarse): [96, 192, 384, 768]  (approximate; check your build)
+# FPN levels (fine → coarse): backbone outputs 3 levels [32, 64, 256]
 # ---------------------------------------------------------------------------
-SAM2_HIERA_SMALL_FPN_DIMS = [256, 256, 256, 256]  # FPN neck normalizes to d_model=256
+SAM2_HIERA_SMALL_FPN_DIMS = [32, 64, 256]  # 3 FPN levels: fine (32) → coarse (256)
 
 
 class TGSAM2(nn.Module):
@@ -185,18 +185,23 @@ class TGSAM2(nn.Module):
             )
 
             # 4. Mask decoding with text as sparse prompt
-            pred_mask = self._decode_mask(frame_embed, Tembed, backbone_out)
-            # pred_mask: (B, 1, H, W)
+            pred_mask = self._decode_mask(frame_embed, Tembed, backbone_out, (H, W))
+            # pred_mask: (B, 1, H, W) at original resolution
 
             all_masks.append(pred_mask)
 
             # 5. Update memory bank using TTME
-            mem_feature = self.ttme(
-                visual=enriched_feats[-1],  # coarsest FPN feature (B, C, h, w)
-                mask=pred_mask,  # (B, 1, H, W)
-                text=text_raw,  # (B, L, 768)
-            )
-            memory_bank.append(mem_feature)
+            try:
+                mem_feature = self.ttme(
+                    visual=enriched_feats[-1],  # coarsest FPN feature (B, C, h, w)
+                    mask=pred_mask,  # (B, 1, H, W)
+                    text=text_raw,  # (B, L, 768)
+                )
+                memory_bank.append(mem_feature)
+            except Exception as e:
+                print(
+                    f"[DEBUG] TTME error - enriched_feats[-1] shape: {enriched_feats[-1].shape}, pred_mask shape: {pred_mask.shape}, error: {e}"
+                )
 
         pred_masks = torch.stack(all_masks, dim=1)  # (B, T, 1, H, W)
 
@@ -249,10 +254,11 @@ class TGSAM2(nn.Module):
             return current_feat
 
     # -----------------------------------------------------------------------
-    def _decode_mask(self, frame_embed, Tembed, backbone_out):
+    def _decode_mask(self, frame_embed, Tembed, backbone_out, image_size):
         """
         Run SAM-2 mask decoder using text as sparse prompt.
         Tembed: (B, L, D) — text token embeddings treated as sparse prompt.
+        image_size: (H, W) — original image resolution for upsampling masks
         """
         B = frame_embed.shape[0]
         device = frame_embed.device
@@ -266,10 +272,14 @@ class TGSAM2(nn.Module):
                 Tembed,
                 backbone_out,
             )
+            # Upsample to original image resolution
+            masks = F.interpolate(
+                masks, size=image_size, mode="bilinear", align_corners=False
+            )
             return masks
         except Exception:
             # Fallback: simple convolutional head on the frame embedding
-            return self._fallback_decode(frame_embed, frame_embed.shape[-2:])
+            return self._fallback_decode(frame_embed, image_size)
 
     def _fallback_decode(self, feat, spatial_size):
         """
