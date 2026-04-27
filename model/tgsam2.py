@@ -40,7 +40,7 @@ except ImportError:
 # SAM-2 channel dims for hiera_small
 # FPN levels (fine → coarse): [96, 192, 384, 768]  (approximate; check your build)
 # ---------------------------------------------------------------------------
-SAM2_HIERA_SMALL_FPN_DIMS = [96, 192, 384, 768]
+SAM2_HIERA_SMALL_FPN_DIMS = [256, 256, 256, 256]  # FPN neck normalizes to d_model=256
 
 
 class TGSAM2(nn.Module):
