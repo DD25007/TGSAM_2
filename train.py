@@ -315,11 +315,6 @@ def main(args):
             # Clear GPU memory after validation
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                logger.info(
-                    f"Epoch {epoch+1}/{config['train']['num_epochs']} | "
-                    f"Train Loss: {train_metrics['loss']:.4f} DSC: {train_metrics['dsc']:.4f} | "
-                    f"Val Loss: {val_metrics['loss']:.4f} DSC: {val_metrics['dsc']:.4f}"
-                )
 
             # Save best checkpoint
             if val_metrics["dsc"] > best_dsc:
