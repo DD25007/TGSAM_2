@@ -1,0 +1,4 @@
+dataset/
+segment-anything-2/
+__pycache__/
+.vscode/
