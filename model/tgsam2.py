@@ -129,12 +129,6 @@ class TGSAM2(nn.Module):
         backbone_out = self.sam2.forward_image(frame)
         fpn_features = backbone_out["backbone_fpn"]  # list of (B, C_i, H_i, W_i)
 
-        # Debug: Print actual FPN dimensions if different from assumed
-        actual_dims = [f.shape[1] for f in fpn_features]
-        if not hasattr(self, "_logged_fpn_dims"):
-            print(f"[DEBUG] Actual FPN dims: {actual_dims}")
-            self._logged_fpn_dims = True
-
         # Apply TCVP: condition visual features on text
         enriched = self.tcvp(fpn_features, T)  # same structure
 
