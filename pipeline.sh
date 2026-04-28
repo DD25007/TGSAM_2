@@ -11,7 +11,7 @@ set -e  # Exit on any error
 # Parse arguments
 GPU_ID=${1:-0}
 NUM_EPOCHS=30
-for DATASET in acdc spleen prostate cvc; do
+for DATASET in spleen prostate cvc acdc; do
 
     # Set CUDA device
     export CUDA_VISIBLE_DEVICES=$GPU_ID
@@ -52,10 +52,10 @@ for DATASET in acdc spleen prostate cvc; do
     echo "Checkpoint dir: $CHECKPOINT_DIR"
     echo ""
 
-    # python train.py \
-    #     --config "$CONFIG_PATH" \
-    #     --device "cuda:0" \
-    #     --num_epochs $NUM_EPOCHS
+    python train.py \
+        --config "$CONFIG_PATH" \
+        --device "cuda:0" \
+        --num_epochs $NUM_EPOCHS
 
     # Find best checkpoint
     echo ""

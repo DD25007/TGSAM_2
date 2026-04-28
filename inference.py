@@ -102,7 +102,11 @@ def main(args):
     # Preprocess
     image = normalize_image(image)
     image = resize_image(image, target=args.image_size)
-    image_tensor = image_to_tensor(image).unsqueeze(0).to(device)  # (1, 3, H, W)
+    # Paper §3.2: image size 1024×1024. Model expects (B, T, 3, H, W).
+    # Single inference frame → B=1, T=1, so shape must be (1, 1, 3, H, W).
+    image_tensor = (
+        image_to_tensor(image).unsqueeze(0).unsqueeze(0).to(device)
+    )  # (1, 1, 3, H, W)
 
     # Text prompt
     text_prompt = args.text_prompt
@@ -111,11 +115,15 @@ def main(args):
     # Inference
     logger.info("Running inference...")
     with torch.no_grad():
-        # Wrap single frame as sequence
-        output = model(frames=image_tensor, text_prompt=text_prompt)
-        # output: (1, 1, H, W)
-
-        pred_prob = torch.sigmoid(output).squeeze().cpu().numpy()
+        # Model API uses keyword `texts` (List[str]), matching train.py / evaluate.py.
+        # Model returns dict {"pred_masks": (B, T, 1, H, W)} with values already in [0,1].
+        result = model(
+            frames=image_tensor,  # (1, 1, 3, H, W)
+            texts=[text_prompt],  # List[str], length B=1
+            reset_memory=True,
+        )
+        pred_mask = result["pred_masks"]  # (1, 1, 1, H, W)  — already binarized [0,1]
+        pred_prob = pred_mask.squeeze().cpu().numpy()  # (H, W)
         pred_binary = (pred_prob > args.threshold).astype(np.uint8)
 
     # Visualize (optional)

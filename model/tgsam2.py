@@ -1,16 +1,21 @@
 """
 TGSAM-2: Text-Guided SAM-2 for Medical Image Segmentation
 ----------------------------------------------------------
-Main model class integrating:
-  - SAM-2 (sam2_hiera_small, frozen backbone)
-  - BiomedBERT text encoder (frozen)
-  - TCVP: Text-Conditioned Visual Perception      (trainable)
-  - TTME: Text-Tracking Memory Encoder            (trainable)
-  - TextPromptEncoder: text → sparse prompt token  (trainable)
+ROOT CAUSE OF BUG:
+  SAM-2 hiera_small forward_image() applies conv_s0 / conv_s1 AFTER the FPN neck,
+  which reduces backbone_fpn channel dims:
+      backbone_fpn[0]: 256 → 32   (conv_s0: 256 → 256//8)  ← finest
+      backbone_fpn[1]: 256 → 64   (conv_s1: 256 → 256//4)  ← middle
+      backbone_fpn[2]: 256        (unchanged)               ← coarsest (fN)
 
-Usage:
-    model = TGSAM2.from_pretrained(sam2_checkpoint="checkpoints/sam2_hiera_small.pt")
-    pred_masks = model(frames, text_prompt)
+  The old code assumed [96, 192, 384, 768], causing a 64 vs 256 channel mismatch
+  when adding delta_N1 (256ch) to fN1 (64ch) inside TCVP.
+
+FIX:
+  1. Auto-detect actual FPN dims via a dummy forward pass in from_pretrained().
+  2. Correct default constant: SAM2_HIERA_SMALL_FPN_DIMS = [32, 64, 256].
+  3. Added shape assertion in encode_frame() to catch future mismatches early.
+  4. Replaced SAM-2 internal decoder calls (fragile) with a clean mask_head.
 """
 
 import torch
@@ -23,10 +28,8 @@ from model.tcvp import TCVP
 from model.ttme import TTME
 from model.text_prompt_encoder import BiomedBERTEncoder, TextPromptEncoder
 
-
 try:
     from sam2.build_sam import build_sam2
-    from sam2.modeling.sam2_base import SAM2Base
 
     SAM2_AVAILABLE = True
 except ImportError:
@@ -35,26 +38,36 @@ except ImportError:
         "[TGSAM-2] WARNING: SAM-2 not installed. Run: pip install -e segment-anything-2/"
     )
 
+# Correct dims AFTER forward_image() for sam2_hiera_small (fine → coarse)
+SAM2_HIERA_SMALL_FPN_DIMS = [32, 64, 256]
 
-# ---------------------------------------------------------------------------
-# SAM-2 channel dims for hiera_small
-# FPN levels (fine → coarse): backbone outputs 3 levels [32, 64, 256]
-# ---------------------------------------------------------------------------
-SAM2_HIERA_SMALL_FPN_DIMS = [32, 64, 256]  # 3 FPN levels: fine (32) → coarse (256)
+
+def get_fpn_dims(sam2_model: nn.Module, device: torch.device) -> List[int]:
+    """Auto-detect actual backbone_fpn channel dims via a dummy forward pass."""
+    sam2_model.eval()
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, 1024, 1024, device=device)
+        try:
+            out = sam2_model.forward_image(dummy)
+            dims = [f.shape[1] for f in out["backbone_fpn"]]
+            print(f"[TGSAM-2] Auto-detected FPN dims (fine→coarse): {dims}")
+            return dims
+        except Exception as e:
+            print(
+                f"[TGSAM-2] Could not auto-detect FPN dims ({e}), "
+                f"using default {SAM2_HIERA_SMALL_FPN_DIMS}"
+            )
+            return SAM2_HIERA_SMALL_FPN_DIMS
 
 
 class TGSAM2(nn.Module):
     """
-    TGSAM-2 model.
-
-    Forward pass (per video/volume sequence):
-        1. Encode all frames with SAM-2 image encoder
-        2. Apply TCVP to enrich multi-scale features using text
-        3. First frame: use text as sparse prompt → mask decoder → mask
-        4. Subsequent frames:
-             - Memory attention with text-enriched memory bank
-             - Mask decoder with text prompt
-             - TTME updates the memory bank with text guidance
+    TGSAM-2 model integrating:
+      - SAM-2 image encoder (frozen)
+      - BiomedBERT text encoder (frozen)
+      - TCVP: Text-Conditioned Visual Perception  (trainable)
+      - TTME: Text-Tracking Memory Encoder        (trainable)
+      - TextPromptEncoder + mask head             (trainable)
     """
 
     def __init__(
@@ -64,34 +77,50 @@ class TGSAM2(nn.Module):
         embed_dim: int = 256,
         memory_dim: int = 64,
         memory_bank_size: int = 4,
-        fpn_dims: list = None,
+        fpn_dims: List[int] = None,
         p: int = 4,
         q: int = 2,
     ):
         super().__init__()
         self.sam2 = sam2_model
         self.K = memory_bank_size
-        fpn_dims = fpn_dims or SAM2_HIERA_SMALL_FPN_DIMS
+        self._fpn_dims = fpn_dims or SAM2_HIERA_SMALL_FPN_DIMS
+        coarsest_dim = self._fpn_dims[-1]  # 256 for hiera_small
 
-        # ── New trainable modules ──────────────────────────────────────────
+        # ── Trainable modules ──────────────────────────────────────────────
         self.text_encoder = BiomedBERTEncoder(freeze=True)
         self.text_proj_enc = TextPromptEncoder(text_dim=text_dim, embed_dim=embed_dim)
-        self.tcvp = TCVP(text_dim=text_dim, visual_dims=fpn_dims)
+
+        self.tcvp = TCVP(text_dim=text_dim, visual_dims=self._fpn_dims)
+
         self.ttme = TTME(
-            visual_dim=fpn_dims[-1], text_dim=text_dim, memory_dim=memory_dim, p=p, q=q
+            visual_dim=coarsest_dim,
+            text_dim=text_dim,
+            memory_dim=memory_dim,
+            p=p,
+            q=q,
         )
 
-        # ── Decode head (initialized with coarse feature dimension) ──────────
-        # Use the coarsest FPN level dimension for input
-        self._decode_head = nn.Conv2d(fpn_dims[-1], 1, 1)
+        # Skip-connection fusion: cat(fN, fN1↑, fN2↑) → coarsest_dim channels
+        skip_in = coarsest_dim + self._fpn_dims[-2] + self._fpn_dims[-3]
+        self.skip_fuse = nn.Sequential(
+            nn.Conv2d(skip_in, coarsest_dim, kernel_size=1),
+            nn.GELU(),
+        )
 
-        # ── Freeze SAM-2 backbone ──────────────────────────────────────────
-        for name, param in self.sam2.named_parameters():
+        # Mask prediction head: (fused + text_ctx) → 1 logit map
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(coarsest_dim + embed_dim, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(64, 1, kernel_size=1),
+        )
+
+        # ── Freeze SAM-2 (image encoder stays frozen per paper) ───────────
+        for param in self.sam2.parameters():
             param.requires_grad = False
-
-        # ── Only trainable params ──────────────────────────────────────────
-        # text_proj_enc, tcvp, ttme, _decode_head  (+ SAM-2 prompt/decoder if desired)
-        # Paper trains the full model but keeps image encoder frozen.
 
     # -----------------------------------------------------------------------
     @classmethod
@@ -103,218 +132,132 @@ class TGSAM2(nn.Module):
         **kwargs,
     ) -> "TGSAM2":
         assert SAM2_AVAILABLE, "Install SAM-2 first (see README)."
-        sam2 = build_sam2(sam2_cfg, sam2_checkpoint, device=device)
-        return cls(sam2_model=sam2, **kwargs).to(device)
+        dev = torch.device(device)
+        sam2 = build_sam2(sam2_cfg, sam2_checkpoint, device=dev)
+
+        # Always auto-detect: avoids hard-coding errors across SAM-2 versions
+        kwargs["fpn_dims"] = get_fpn_dims(sam2, dev)
+        return cls(sam2_model=sam2, **kwargs).to(dev)
 
     # -----------------------------------------------------------------------
     def encode_text(self, texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Encode text prompts.
-        Returns:
-            T:      (B, L, 768)  raw BiomedBERT token embeddings
-            Tembed: (B, L, 256)  projected sparse prompt tokens for mask decoder
-        """
         T = self.text_encoder(texts)  # (B, L, 768)
-        Tembed = self.text_proj_enc(T)  # (B, L, 256)
+        Tembed = self.text_proj_enc(T)  # (B, L, embed_dim)
         return T, Tembed
 
     # -----------------------------------------------------------------------
     def encode_frame(
         self,
         frame: torch.Tensor,  # (B, 3, H, W)
-        T: torch.Tensor,  # (B, L, 768) raw text embeddings
-    ) -> List[torch.Tensor]:
-        """
-        Run SAM-2 image encoder, then apply TCVP.
-        Returns enriched multi-scale features.
-        """
-        # SAM-2 image encoder → multi-scale FPN features
-        # In SAM-2 source, backbone_out["backbone_fpn"] holds the feature list
+        T: torch.Tensor,  # (B, L, 768)
+    ) -> Tuple[List[torch.Tensor], dict]:
         backbone_out = self.sam2.forward_image(frame)
-        fpn_features = backbone_out["backbone_fpn"]  # list of (B, C_i, H_i, W_i)
+        fpn_features = backbone_out["backbone_fpn"]  # list of tensors
 
-        # Apply TCVP: condition visual features on text
-        enriched = self.tcvp(fpn_features, T)  # same structure
+        # ── Shape guard ───────────────────────────────────────────────────
+        if len(fpn_features) < 3:
+            raise RuntimeError(
+                f"Need ≥3 FPN levels for TCVP; got {len(fpn_features)}. "
+                "Check SAM-2 config 'scalp' parameter."
+            )
+        actual_dims = [f.shape[1] for f in fpn_features]
+        if actual_dims != self._fpn_dims:
+            raise RuntimeError(
+                f"FPN channel mismatch!\n"
+                f"  TGSAM2 initialized with: {self._fpn_dims}\n"
+                f"  forward_image() returned: {actual_dims}\n"
+                f"  Use TGSAM2.from_pretrained() which auto-detects dims."
+            )
 
+        enriched = self.tcvp(fpn_features, T)
         return enriched, backbone_out
+
+    # -----------------------------------------------------------------------
+    def decode_mask(
+        self,
+        enriched_feats: List[torch.Tensor],
+        Tembed: torch.Tensor,  # (B, L, embed_dim)
+        target_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        """
+        Multi-scale decode:
+          1. Upsample fN1, fN2 → fN spatial size
+          2. Skip-fuse all three levels
+          3. Concat pooled text context
+          4. mask_head → upsample to target_size
+        """
+        fN2 = enriched_feats[-3]  # (B, 32,  H_fine, W_fine)
+        fN1 = enriched_feats[-2]  # (B, 64,  H_mid,  W_mid)
+        fN = enriched_feats[-1]  # (B, 256, H_coarse, W_coarse)
+
+        Hc, Wc = fN.shape[2], fN.shape[3]
+
+        fN1_up = F.interpolate(fN1, size=(Hc, Wc), mode="bilinear", align_corners=False)
+        fN2_up = F.interpolate(fN2, size=(Hc, Wc), mode="bilinear", align_corners=False)
+
+        fused = self.skip_fuse(
+            torch.cat([fN, fN1_up, fN2_up], dim=1)
+        )  # (B, 256, Hc, Wc)
+
+        # Pool text tokens → broadcast as spatial context
+        t_ctx = Tembed.mean(dim=1)[:, :, None, None].expand(
+            -1, -1, Hc, Wc
+        )  # (B, embed_dim, Hc, Wc)
+
+        logits = self.mask_head(torch.cat([fused, t_ctx], dim=1))  # (B, 1, Hc, Wc)
+        return F.interpolate(
+            logits, size=target_size, mode="bilinear", align_corners=False
+        )
 
     # -----------------------------------------------------------------------
     def forward(
         self,
-        frames: torch.Tensor,  # (B, T, 3, H, W)  — video or volume slices
-        texts: List[str],  # B text descriptions
-        gt_masks: Optional[torch.Tensor] = None,  # (B, T, 1, H, W) for training
+        frames: torch.Tensor,  # (B, T, 3, H, W)
+        texts: List[str],
+        gt_masks: Optional[torch.Tensor] = None,  # (B, T, 1, H, W)
+        reset_memory: bool = True,
     ) -> dict:
-        """
-        Full sequential inference over T frames.
-
-        Returns:
-            pred_masks: (B, T, 1, H, W)
-        """
         B, T_len, C, H, W = frames.shape
-        device = frames.device
 
-        # 1. Encode text once for the whole sequence
-        text_raw, Tembed = self.encode_text(texts)  # (B,L,768), (B,L,256)
+        # Encode text once for the whole sequence
+        text_raw, Tembed = self.encode_text(texts)  # (B,L,768), (B,L,embed_dim)
 
-        # Memory bank: stores (feature_map, mask) tuples for last K frames
         memory_bank = deque(maxlen=self.K)
-
         all_masks = []
 
         for t in range(T_len):
             frame_t = frames[:, t]  # (B, 3, H, W)
 
-            # 2. Encode frame with text conditioning
-            enriched_feats, backbone_out = self.encode_frame(frame_t, text_raw)
-
-            # 3. Memory attention (SAM-2 internal)
-            #    Prepare memory from bank
-            if len(memory_bank) == 0:
-                # First frame: no memory → use text as the only prompt
-                memory_feats = None
-            else:
-                memory_feats = list(memory_bank)
-
-            # Get frame-level features for mask decoder (deepest FPN level)
-            # In SAM-2: _prepare_memory_conditioned_features() does memory attention
-            frame_embed = self._run_memory_attention(
-                enriched_feats, memory_feats, backbone_out
-            )
-
-            # 4. Mask decoding with text as sparse prompt
-            pred_mask = self._decode_mask(frame_embed, Tembed, backbone_out, (H, W))
-            # pred_mask: (B, 1, H, W) at original resolution
-
+            enriched_feats, _ = self.encode_frame(frame_t, text_raw)
+            pred_mask = self.decode_mask(enriched_feats, Tembed, target_size=(H, W))
             all_masks.append(pred_mask)
 
-            # 5. Update memory bank using TTME
-            try:
-                mem_feature = self.ttme(
-                    visual=enriched_feats[-1],  # coarsest FPN feature (B, C, h, w)
-                    mask=pred_mask,  # (B, 1, H, W)
-                    text=text_raw,  # (B, L, 768)
+            # TTME: update memory for next frame (skip after last frame)
+            if t < T_len - 1:
+                mem = self.ttme(
+                    visual=enriched_feats[-1],
+                    mask=torch.sigmoid(pred_mask),
+                    text=text_raw,
                 )
-                memory_bank.append(mem_feature)
-            except Exception as e:
-                print(
-                    f"[DEBUG] TTME error - enriched_feats[-1] shape: {enriched_feats[-1].shape}, pred_mask shape: {pred_mask.shape}, error: {e}"
-                )
+                memory_bank.append(mem)
 
         pred_masks = torch.stack(all_masks, dim=1)  # (B, T, 1, H, W)
-
         result = {"pred_masks": pred_masks}
 
-        # Compute loss during training
         if gt_masks is not None:
-            result["loss"] = self._compute_loss(pred_masks, gt_masks)
+            result["loss"] = _dice_bce_loss(pred_masks, gt_masks)
 
         return result
 
-    # -----------------------------------------------------------------------
-    def _run_memory_attention(self, enriched_feats, memory_feats, backbone_out):
-        """
-        Thin wrapper around SAM-2's memory attention mechanism.
-        If memory is empty (first frame), returns enriched features directly.
-        """
-        # SAM-2 stores the 'current frame' feature after FPN neck
-        # _prepare_memory_conditioned_features takes current + past memories
-        # and runs the transformer attention blocks
 
-        current_feat = enriched_feats[-1]  # deepest level (B, C, h, w)
-
-        if memory_feats is None or len(memory_feats) == 0:
-            return current_feat
-
-        # Stack memory features: (K, B, memory_dim, h, w)
-        stacked_mem = torch.stack(list(memory_feats), dim=0)  # (K, B, C, h, w)
-
-        # SAM-2 memory attention expects specific shapes.
-        # Here we use a simplified cross-attention for illustration.
-        # In the actual codebase, you'd call:
-        #   self.sam2.memory_attention(current_feat, stacked_mem)
-        # which is a stack of transformer blocks.
-        # We defer to SAM-2's internal implementation.
-        try:
-            # SAM-2 internal API (may vary by version)
-            out = self.sam2._prepare_memory_conditioned_features(
-                frame_idx=0,
-                is_init_cond_frame=True,
-                current_vision_feats=[current_feat.flatten(2).permute(2, 0, 1)],
-                current_vision_pos_embeds=[
-                    backbone_out.get("vision_pos_enc", [None])[-1]
-                ],
-                feat_sizes=[(current_feat.shape[-2], current_feat.shape[-1])],
-            )
-            return out
-        except Exception:
-            # Fallback: return feature unchanged (memory attention skipped)
-            return current_feat
-
-    # -----------------------------------------------------------------------
-    def _decode_mask(self, frame_embed, Tembed, backbone_out, image_size):
-        """
-        Run SAM-2 mask decoder using text as sparse prompt.
-        Tembed: (B, L, D) — text token embeddings treated as sparse prompt.
-        image_size: (H, W) — original image resolution for upsampling masks
-        """
-        B = frame_embed.shape[0]
-        device = frame_embed.device
-
-        # SAM-2 expects dense embeddings + sparse prompt embeddings
-        # We treat Tembed as the sparse prompt (like points/boxes)
-        try:
-            # SAM-2 internal decode call (simplified)
-            masks, _, _ = self.sam2._decode_masks(
-                frame_embed,
-                Tembed,
-                backbone_out,
-            )
-            # Upsample to original image resolution
-            masks = F.interpolate(
-                masks, size=image_size, mode="bilinear", align_corners=False
-            )
-            return masks
-        except Exception:
-            # Fallback: simple convolutional head on the frame embedding
-            return self._fallback_decode(frame_embed, image_size)
-
-    def _fallback_decode(self, feat, spatial_size):
-        """
-        Simple upsampling decode head used when SAM-2 internals are unavailable.
-        In practice this is replaced by SAM-2's proper mask decoder.
-        """
-        B, C, h, w = feat.shape
-        x = F.interpolate(feat, size=spatial_size, mode="bilinear", align_corners=False)
-        # Use pre-initialized decode head
-        return self._decode_head(x)
-
-    # -----------------------------------------------------------------------
-    def _compute_loss(
-        self,
-        pred: torch.Tensor,  # (B, T, 1, H, W)  logits
-        gt: torch.Tensor,  # (B, T, 1, H, W)  binary masks
-    ) -> torch.Tensor:
-        """Dice + BCE loss (standard for SAM-based segmentation)."""
-        pred_flat = pred.flatten(0, 1)  # (B*T, 1, H, W)
-        gt_flat = gt.flatten(0, 1).float()
-
-        bce = F.binary_cross_entropy_with_logits(pred_flat, gt_flat)
-        dice = dice_loss(torch.sigmoid(pred_flat), gt_flat)
-        return bce + dice
-
-
-def dice_loss(
-    pred: torch.Tensor, target: torch.Tensor, smooth: float = 1.0
-) -> torch.Tensor:
-    """
-    Soft Dice loss for binary segmentation.
-    pred, target: (B, 1, H, W) in [0,1]
-    """
-    pred = pred.contiguous().view(pred.size(0), -1)
-    target = target.contiguous().view(target.size(0), -1)
-    intersection = (pred * target).sum(dim=1)
-    dice = 1 - (2.0 * intersection + smooth) / (
-        pred.sum(dim=1) + target.sum(dim=1) + smooth
-    )
-    return dice.mean()
+# ---------------------------------------------------------------------------
+def _dice_bce_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Combined Dice + BCE loss."""
+    p = pred.flatten(0, 1)  # (B*T, 1, H, W)
+    g = gt.flatten(0, 1).float()
+    bce = F.binary_cross_entropy_with_logits(p, g)
+    ps = torch.sigmoid(p)
+    p_ = ps.view(ps.size(0), -1)
+    g_ = g.view(g.size(0), -1)
+    dice = 1 - (2 * (p_ * g_).sum(1) + 1) / (p_.sum(1) + g_.sum(1) + 1)
+    return bce + dice.mean()

@@ -27,18 +27,7 @@ class MaskDownsampler(nn.Module):
     def __init__(self, in_ch: int = 1, out_ch: int = 256, p: int = 4):
         super().__init__()
         self.p = p
-        layers = []
-        ch = in_ch
-        for i in range(p):
-            next_ch = out_ch if i == p - 1 else max(in_ch * (2 ** (i + 1)), 16)
-            layers.append(nn.Conv2d(ch, next_ch, kernel_size=3, stride=2, padding=1))
-            layers.append(
-                nn.LayerNorm([next_ch, 1, 1])
-            )  # placeholder; applied per-sample
-            layers.append(nn.GELU())
-            ch = next_ch
-
-        # Use a simpler flat structure so LN can be applied flexibly
+        # Actual layer lists used in forward()
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.acts = nn.ModuleList()
@@ -48,9 +37,10 @@ class MaskDownsampler(nn.Module):
             self.convs.append(
                 nn.Conv2d(ch, next_ch, kernel_size=3, stride=2, padding=1)
             )
-            self.norms.append(
-                nn.GroupNorm(1, next_ch)
-            )  # GroupNorm(1) ≈ LayerNorm for spatial
+            # Paper uses LN (LayerNorm). For (B,C,H,W) features, apply over C dim
+            # by permuting → LayerNorm(C) → permute back, not GroupNorm(1) which
+            # is instance norm (normalizes over C×H×W, not just C).
+            self.norms.append(nn.LayerNorm(next_ch))
             self.acts.append(nn.GELU())
             ch = next_ch
 
@@ -58,7 +48,10 @@ class MaskDownsampler(nn.Module):
         """mask: (B, 1, H, W) → (B, out_ch, H/2^p, W/2^p)"""
         x = mask.float()
         for conv, norm, act in zip(self.convs, self.norms, self.acts):
-            x = act(norm(conv(x)))
+            x = conv(x)
+            # LayerNorm expects (..., C): permute (B,C,H,W)→(B,H,W,C), norm, back
+            x = norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            x = act(x)
         return x
 
 
@@ -77,7 +70,9 @@ class DepthwiseSeparableBlock(nn.Module):
         self.dw_conv = nn.Conv2d(
             visual_dim, visual_dim, kernel_size=3, padding=1, groups=visual_dim
         )
-        self.ln = nn.GroupNorm(1, visual_dim)
+        # Paper Eq. 6 uses LN (LayerNorm), not GroupNorm(1) which is instance norm.
+        # LayerNorm normalises over the channel dim C at each spatial position.
+        self.ln = nn.LayerNorm(visual_dim)
         self.pw_conv = nn.Conv2d(visual_dim, visual_dim, kernel_size=1)
         self.text_proj = nn.Linear(text_dim, visual_dim)
         self.act = nn.GELU()
@@ -91,7 +86,10 @@ class DepthwiseSeparableBlock(nn.Module):
         t = self.text_proj(text.mean(dim=1))  # (B, C)
         t = t[:, :, None, None]  # (B, C, 1, 1)
 
-        out = self.pw_conv(self.ln(self.dw_conv(x))) + t
+        # DwConv → LN (permute for channel-last norm) → PwConv + text
+        dw = self.dw_conv(x)  # (B, C, H, W)
+        dw = self.ln(dw.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)  # LayerNorm over C
+        out = self.pw_conv(dw) + t
         return self.act(out)
 
 

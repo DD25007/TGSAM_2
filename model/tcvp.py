@@ -161,12 +161,23 @@ class TCVP(nn.Module):
         fN_flat = fN_flat + delta
         fN_updated = fN_flat.transpose(1, 2).reshape(B, C_N, H_N, W_N)
 
-        # Propagate to finer levels via transposed convolution
+        # Propagate to finer levels via transposed convolution.
+        # Paper Eq. 4: fN-1 += Act(DeConv(fN))  →  fN-2 += DeConv(fN-1)
+        # The second DeConv must receive the UPDATED fN-1 (fN1 + delta_N1),
+        # not just the delta alone.
         delta_N1 = self.deconv_N_to_N1(fN_updated)  # (B, C_N1, H_N1, W_N1)
-        delta_N2 = self.deconv_N1_to_N2(delta_N1)  # (B, C_N2, H_N2, W_N2)
-
-        # Residual addition
+        # Safety: stride-2 deconv can be off-by-one on odd spatial sizes
+        if delta_N1.shape[-2:] != fN1.shape[-2:]:
+            delta_N1 = F.interpolate(
+                delta_N1, size=fN1.shape[-2:], mode="bilinear", align_corners=False
+            )
         fN1_updated = fN1 + delta_N1
+
+        delta_N2 = self.deconv_N1_to_N2(fN1_updated)  # (B, C_N2, H_N2, W_N2)
+        if delta_N2.shape[-2:] != fN2.shape[-2:]:
+            delta_N2 = F.interpolate(
+                delta_N2, size=fN2.shape[-2:], mode="bilinear", align_corners=False
+            )
         fN2_updated = fN2 + delta_N2
 
         # Replace last 3 levels; leave finer levels unchanged

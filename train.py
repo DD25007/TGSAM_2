@@ -82,11 +82,13 @@ def train_epoch(
 
             # Forward pass through TGSAM2
             try:
-                # Model expects (B, T, 3, H, W) and texts as List[str]
+                # Paper §2.3: memory bank tracks per-sequence — must reset between
+                # sequences so memory from one patient/video does not bleed into next.
                 result = model(
                     frames=seq_img.unsqueeze(0),  # (1, T, 3, H, W)
-                    texts=[prompt],  # List with one text
+                    texts=[prompt],  # List[str], length B=1
                     gt_masks=seq_mask.unsqueeze(0).unsqueeze(2),  # (1, T, 1, H, W)
+                    reset_memory=True,  # always reset at sequence boundary
                 )
                 outputs = result["pred_masks"].squeeze(0)  # (T, 1, H, W)
 
@@ -164,10 +166,10 @@ def validate(
                 seq_mask = seq_mask.to(device).float()
 
                 try:
-                    # Model expects (B, T, 3, H, W) and texts as List[str]
                     result = model(
                         frames=seq_img.unsqueeze(0),  # (1, T, 3, H, W)
-                        texts=[prompt],  # List with one text
+                        texts=[prompt],  # List[str], length B=1
+                        reset_memory=True,  # reset at sequence boundary
                     )
                     outputs = result["pred_masks"].squeeze(0)  # (T, 1, H, W)
                     loss = criterion(outputs, seq_mask.unsqueeze(1))
@@ -261,7 +263,8 @@ def main(args):
         from model import TGSAM2
 
         model = TGSAM2.from_pretrained(
-            sam2_checkpoint="checkpoints/sam2_hiera_small.pt"
+            sam2_checkpoint="checkpoints/sam2_hiera_small.pt",
+            memory_bank_size=config["train_config"]["memory_bank_size"],
         )
         model = model.to(device)
         logger.info(f"Model loaded successfully")

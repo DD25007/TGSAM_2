@@ -3,7 +3,7 @@
 Implementation of the MICCAI 2024 paper:  
 **"TGSAM-2: Text-Guided Medical Image Segmentation using Segment Anything Model 2"**
 
-[[Paper](https://arxiv.org/abs/2502.11093)] | [[Code](https://github.com/YuanRuntian/Text-Promptable-Propagation)]
+[[Paper](https://arxiv.org/abs/2502.11093)]
 
 ---
 

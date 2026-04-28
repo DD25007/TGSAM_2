@@ -40,6 +40,7 @@ def evaluate(
     device: torch.device,
     config: dict,
     threshold: float = 0.5,
+    verbose: bool = True,
 ) -> dict:
     """Evaluate model on test set."""
     model.eval()
@@ -71,7 +72,8 @@ def evaluate(
                     # Forward pass - model expects (B, T, 3, H, W) and texts as List[str]
                     result = model(
                         frames=seq_img.unsqueeze(0),  # (1, T, 3, H, W)
-                        texts=[prompt]  # List with one text
+                        texts=[prompt],  # List[str], length B=1
+                        reset_memory=True,  # reset at sequence boundary
                     )
                     # result should have "pred_masks" key with shape (1, T, 1, H, W)
                     if isinstance(result, dict):
@@ -82,13 +84,14 @@ def evaluate(
                     if outputs.dim() == 3:
                         outputs = outputs.unsqueeze(1)  # (T, 1, H, W)
 
-                    # Binarize
+                    # Binarize — outputs shape: (T, 1, H, W)
                     pred_binary = (outputs > threshold).long()
 
                     # Compute metrics for each frame
                     for frame_idx in range(seq_img.shape[0]):
-                        pred_frame = pred_binary[frame_idx]
-                        mask_frame = seq_mask[frame_idx]
+                        # squeeze channel dim: (1,H,W) → (H,W) to match mask shape
+                        pred_frame = pred_binary[frame_idx].squeeze(0)  # (H, W)
+                        mask_frame = seq_mask[frame_idx]  # (H, W)
 
                         dsc = metrics.dice_similarity_coefficient(
                             pred_frame, mask_frame
@@ -128,7 +131,9 @@ def evaluate(
 
     # Check if we have any samples
     if len(all_dsc) == 0:
-        logger.error("No samples evaluated. Check dataset path and split configuration.")
+        logger.error(
+            "No samples evaluated. Check dataset path and split configuration."
+        )
         return {
             "dsc": {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0},
             "iou": {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0},
@@ -296,7 +301,11 @@ def main(args):
         test_loader,
         device,
         config,
-        threshold=config["eval"]["threshold"],
+        threshold=(
+            args.threshold
+            if args.threshold is not None
+            else config["eval"].get("threshold", 0.5)
+        ),
     )
 
     # Clear GPU memory after evaluation
@@ -330,6 +339,12 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cuda:0", help="Device to use")
     parser.add_argument(
         "--output_dir", default="outputs/eval", help="Directory to save results"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Binarization threshold (default: from config)",
     )
 
     args = parser.parse_args()
