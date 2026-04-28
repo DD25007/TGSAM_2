@@ -68,12 +68,19 @@ def evaluate(
                 seq_mask = seq_mask.to(device).float()  # (T, H, W)
 
                 try:
-                    # Forward pass
-                    outputs = model(frames=seq_img, text_prompt=prompt)
-                    # outputs: (T, 1, H, W) or (T, H, W)
+                    # Forward pass - model expects (B, T, 3, H, W) and texts as List[str]
+                    result = model(
+                        frames=seq_img.unsqueeze(0),  # (1, T, 3, H, W)
+                        texts=[prompt]  # List with one text
+                    )
+                    # result should have "pred_masks" key with shape (1, T, 1, H, W)
+                    if isinstance(result, dict):
+                        outputs = result["pred_masks"].squeeze(0)  # (T, 1, H, W)
+                    else:
+                        outputs = result.squeeze(0)  # (T, 1, H, W)
 
-                    if outputs.dim() == 4:
-                        outputs = outputs.squeeze(1)
+                    if outputs.dim() == 3:
+                        outputs = outputs.unsqueeze(1)  # (T, 1, H, W)
 
                     # Binarize
                     pred_binary = (outputs > threshold).long()
@@ -118,6 +125,18 @@ def evaluate(
                 except Exception as e:
                     logger.warning(f"Error processing sequence {seq_idx}: {e}")
                     continue
+
+    # Check if we have any samples
+    if len(all_dsc) == 0:
+        logger.error("No samples evaluated. Check dataset path and split configuration.")
+        return {
+            "dsc": {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0},
+            "iou": {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0},
+            "sensitivity": {"mean": 0.0, "std": 0.0},
+            "specificity": {"mean": 0.0, "std": 0.0},
+            "num_samples": 0,
+            "results_per_sample": [],
+        }
 
     # Compute statistics
     results = {
@@ -212,7 +231,7 @@ def main(args):
     # Setup device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
-    
+
     # GPU memory optimization
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -224,7 +243,7 @@ def main(args):
     test_dataset = get_dataset(
         name=config["dataset"]["name"],
         root=config["dataset"]["root"],
-        split="test",
+        split=config["dataset"].get("test_split", "testing"),
         image_size=config["dataset"]["image_size"],
         augment=False,
     )
@@ -245,11 +264,13 @@ def main(args):
         from model import TGSAM2
 
         if args.checkpoint:
-            checkpoint = torch.load(args.checkpoint, map_location=device)
+            checkpoint = torch.load(
+                args.checkpoint, map_location=device, weights_only=False
+            )
             model = TGSAM2.from_pretrained(
                 sam2_checkpoint="checkpoints/sam2_hiera_small.pt"
             )
-            model.load_state_dict(checkpoint["model_state_dict"])
+            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
             logger.info(f"Loaded checkpoint from {args.checkpoint}")
         else:
             model = TGSAM2.from_pretrained(
@@ -265,11 +286,11 @@ def main(args):
 
     # Evaluate
     logger.info("Starting evaluation...")
-    
+
     # Clear GPU memory before evaluation
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
+
     results = evaluate(
         model,
         test_loader,
@@ -277,7 +298,7 @@ def main(args):
         config,
         threshold=config["eval"]["threshold"],
     )
-    
+
     # Clear GPU memory after evaluation
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

@@ -198,6 +198,11 @@ def main(args):
     config = load_config(args.config)
     logger.info(f"Loaded config from {args.config}")
 
+    # Override num_epochs if provided via command line
+    if args.num_epochs is not None:
+        config["train"]["num_epochs"] = args.num_epochs
+        logger.info(f"Overriding num_epochs to {args.num_epochs}")
+
     # Setup device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -358,6 +363,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--device", default="cuda", help="Device to use (cuda, cpu, etc.)"
+    )
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=None,
+        help="Number of epochs to train (overrides config)",
     )
 
     args = parser.parse_args()

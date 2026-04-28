@@ -1,0 +1,25 @@
+============================================================
+TGSAM-2 Evaluation Results
+============================================================
+
+Number of samples: 1076
+
+Dice Similarity Coefficient (DSC)
+  Mean: 0.0922
+  Std:  0.2890
+  Min:  0.0000
+  Max:  1.0000
+
+Intersection over Union (IoU)
+  Mean: 0.0922
+  Std:  0.2890
+  Min:  0.0000
+  Max:  1.0000
+
+Sensitivity
+  Mean: 0.0000
+  Std:  0.0000
+
+Specificity
+  Mean: 1.0000
+  Std:  0.0000

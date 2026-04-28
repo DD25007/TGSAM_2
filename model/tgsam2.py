@@ -81,12 +81,16 @@ class TGSAM2(nn.Module):
             visual_dim=fpn_dims[-1], text_dim=text_dim, memory_dim=memory_dim, p=p, q=q
         )
 
+        # ── Decode head (initialized with coarse feature dimension) ──────────
+        # Use the coarsest FPN level dimension for input
+        self._decode_head = nn.Conv2d(fpn_dims[-1], 1, 1)
+
         # ── Freeze SAM-2 backbone ──────────────────────────────────────────
         for name, param in self.sam2.named_parameters():
             param.requires_grad = False
 
         # ── Only trainable params ──────────────────────────────────────────
-        # text_proj_enc, tcvp, ttme  (+ SAM-2 prompt/decoder if desired)
+        # text_proj_enc, tcvp, ttme, _decode_head  (+ SAM-2 prompt/decoder if desired)
         # Paper trains the full model but keeps image encoder frozen.
 
     # -----------------------------------------------------------------------
@@ -282,9 +286,7 @@ class TGSAM2(nn.Module):
         """
         B, C, h, w = feat.shape
         x = F.interpolate(feat, size=spatial_size, mode="bilinear", align_corners=False)
-        # Lightweight head
-        if not hasattr(self, "_decode_head"):
-            self._decode_head = nn.Conv2d(C, 1, 1).to(feat.device)
+        # Use pre-initialized decode head
         return self._decode_head(x)
 
     # -----------------------------------------------------------------------

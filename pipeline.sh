@@ -52,9 +52,10 @@ for DATASET in acdc spleen prostate cvc; do
     echo "Checkpoint dir: $CHECKPOINT_DIR"
     echo ""
 
-    python train.py \
-        --config "$CONFIG_PATH" \
-        --device "cuda:0"
+    # python train.py \
+    #     --config "$CONFIG_PATH" \
+    #     --device "cuda:0" \
+    #     --num_epochs $NUM_EPOCHS
 
     # Find best checkpoint
     echo ""
